@@ -100,7 +100,7 @@ func (s *Scheduler) Go(ctx context.Context, f func(context.Context)) {
 		}()
 
 		t.yield()
-		f(context.WithValue(ctx, taskKey, t))
+		f(t.newContext(ctx))
 	}()
 }
 
@@ -209,9 +209,9 @@ func (s *Scheduler) runTimeSlot() {
 // Yield blocks the goroutine if it has been preempted and waits for
 // the scheduler to resume it.
 func Yield(ctx context.Context) {
-	t := fromContext(ctx)
+	t := taskFromContext(ctx)
 	if t == nil {
-		panic("the context doesn't reference a Scheduler")
+		panic(errors.New("the context doesn't reference a Scheduler"))
 	}
 
 	if t.timeSlot >= atomic.LoadUintptr(&t.s.timeSlot) {
@@ -227,22 +227,30 @@ func Yield(ctx context.Context) {
 	t.yield()
 }
 
-var taskKey = new(int)
-
-func fromContext(ctx context.Context) *task {
-	return ctx.Value(taskKey).(*task)
-}
-
 type task struct {
 	s *Scheduler
 
-	wakeCh       chan struct{}
-	timeSlot     uintptr
+	wakeCh   chan struct{}
+	timeSlot uintptr
+
 	start        int64
 	runningTime  int64
 	blockingTime int64
 }
 
+func taskFromContext(ctx context.Context) *task {
+	return ctx.Value(taskKey).(*task)
+}
+
+var taskKey = new(int)
+
+// newContext creates a context with the task embedded.
+func (t *task) newContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, taskKey, t)
+}
+
+// yield unconditionally marks the task as blocked and sends it to the
+// scheduler.
 func (t *task) yield() {
 	now := nowNano()
 	t.runningTime += now - t.start
