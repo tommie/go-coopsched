@@ -62,7 +62,7 @@ func FIFO(t *task) int { return int(t.start) }
 // RunningTimeFair selects the goroutine that has been running the
 // least amount of time. This implements the proposed CFS without
 // priorities.
-func RunningTimeFair(t *task) int { return int(t.runningTime) }
+func RunningTimeFair(t *task) int { return int(t.runningTimeNS) }
 
 // Close stops the scheduler's internal goroutines, but does not stop
 // goroutines started by Go. Yield panics if called after this
@@ -88,15 +88,15 @@ func (s *Scheduler) Go(ctx context.Context, f func(context.Context)) {
 
 	go func() {
 		defer func() {
-			t.runningTime += nowNano() - t.start
+			t.runningTimeNS += nowNano() - t.start
 
 			close(t.wakeCh)
 
 			atomic.AddUintptr(&s.numRunning, ^uintptr(0))
 			s.yieldCh <- nil
 
-			atomic.AddInt64(&s.blockingTimeNS, t.blockingTime)
-			atomic.AddInt64(&s.runningTimeNS, t.runningTime)
+			atomic.AddInt64(&s.blockingTimeNS, t.blockingTimeNS)
+			atomic.AddInt64(&s.runningTimeNS, t.runningTimeNS)
 		}()
 
 		t.yield()
@@ -233,9 +233,9 @@ type task struct {
 	wakeCh   chan struct{}
 	timeSlot uintptr
 
-	start        int64
-	runningTime  int64
-	blockingTime int64
+	start          int64
+	runningTimeNS  int64
+	blockingTimeNS int64
 }
 
 func taskFromContext(ctx context.Context) *task {
@@ -253,7 +253,7 @@ func (t *task) newContext(ctx context.Context) context.Context {
 // scheduler.
 func (t *task) yield() {
 	now := nowNano()
-	t.runningTime += now - t.start
+	t.runningTimeNS += now - t.start
 	t.start = now
 
 	t.s.yieldCh <- t
@@ -262,7 +262,7 @@ func (t *task) yield() {
 	t.timeSlot = atomic.LoadUintptr(&t.s.timeSlot)
 
 	now = nowNano()
-	t.blockingTime += now - t.start
+	t.blockingTimeNS += now - t.start
 	t.start = now
 }
 
