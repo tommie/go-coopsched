@@ -106,6 +106,10 @@ func doBenchmark(b *testing.B, algo SchedulingAlgo, yield bool) {
 		}
 
 		wg.Wait()
+
+		b.Logf("Running time: %v, blocking time: %v",
+			s.RunningTime(),
+			s.BlockingTime())
 	})
 
 	b.Run("channel", func(b *testing.B) {

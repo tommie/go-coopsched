@@ -141,7 +141,7 @@ func (s *Scheduler) runTimeSlot() {
 func Yield(ctx context.Context) {
 	t := fromContext(ctx)
 
-	if t.timeSlot < atomic.LoadUintptr(&t.s.timeSlot) {
+	if t.timeSlot >= atomic.LoadUintptr(&t.s.timeSlot) {
 		return
 	}
 
