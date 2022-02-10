@@ -16,7 +16,7 @@ const cpuFactor = 66
 func ExampleScheduler() {
 	ctx := context.TODO()
 
-	s := NewScheduler(RunningTimeFair)
+	s := NewScheduler(0, RunningTimeFair)
 	defer s.Close()
 
 	var wg sync.WaitGroup
@@ -91,7 +91,7 @@ func doBenchmark(b *testing.B, algo SchedulingAlgo, yield bool) {
 	const amt = 100
 
 	b.Run("cpu", func(b *testing.B) {
-		s := NewScheduler(algo)
+		s := NewScheduler(0, algo)
 		defer s.Close()
 
 		var wg sync.WaitGroup
@@ -107,13 +107,14 @@ func doBenchmark(b *testing.B, algo SchedulingAlgo, yield bool) {
 
 		wg.Wait()
 
-		b.Logf("Running time: %v, blocking time: %v",
-			s.RunningTime(),
-			s.BlockingTime())
+		b.Logf("Avg running time: %v, avg blocking time: %v, avg load: %.1f",
+			s.RunningTime()/time.Duration(b.N),
+			s.BlockingTime()/time.Duration(b.N),
+			s.AvgLoad())
 	})
 
 	b.Run("channel", func(b *testing.B) {
-		s := NewScheduler(algo)
+		s := NewScheduler(0, algo)
 		defer s.Close()
 
 		var waitNS uint64
@@ -130,14 +131,15 @@ func doBenchmark(b *testing.B, algo SchedulingAlgo, yield bool) {
 
 		wg.Wait()
 
-		b.Logf("Avg delay overhead: %v, running time: %v, blocking time: %v",
+		b.Logf("Avg delay overhead: %v, avg running time: %v, avg blocking time: %v, avg load: %.1f",
 			time.Duration(waitNS/uint64(b.N))*time.Nanosecond-amt*time.Millisecond,
-			s.RunningTime(),
-			s.BlockingTime())
+			s.RunningTime()/time.Duration(b.N),
+			s.BlockingTime()/time.Duration(b.N),
+			s.AvgLoad())
 	})
 
 	b.Run("mixed", func(b *testing.B) {
-		s := NewScheduler(algo)
+		s := NewScheduler(0, algo)
 		defer s.Close()
 
 		var waitNS uint64
@@ -160,9 +162,10 @@ func doBenchmark(b *testing.B, algo SchedulingAlgo, yield bool) {
 
 		wg.Wait()
 
-		b.Logf("Avg delay overhead: %v, running time: %v, blocking time: %v",
+		b.Logf("Avg delay overhead: %v, avg running time: %v, avg blocking time: %v, avg load: %.1f",
 			time.Duration(waitNS/uint64(b.N))*time.Nanosecond-amt*time.Millisecond,
-			s.RunningTime(),
-			s.BlockingTime())
+			s.RunningTime()/time.Duration(b.N),
+			s.BlockingTime()/time.Duration(b.N),
+			s.AvgLoad())
 	})
 }

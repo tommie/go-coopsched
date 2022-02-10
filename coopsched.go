@@ -5,6 +5,7 @@ import (
 	"container/heap"
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,25 +16,37 @@ import (
 // unblocks it. Yield blocks if the time slot is up, but is otherwise
 // a no-op.
 type Scheduler struct {
-	taskq        taskQueue
-	doneCh       chan struct{}
-	wakeCh       chan struct{}
-	wg           sync.WaitGroup
-	timeSlot     uintptr
-	blockingTime int64
-	runningTime  int64
+	yieldCh chan *task
+	doneCh  chan struct{}
+	wg      sync.WaitGroup
+
+	numP       uintptr // Configured number of running goroutines.
+	numRunning uintptr // Actual number of running goroutines.
+	timeSlot   uintptr // The currently executing time slot.
+
+	blockingTimeNS int64
+	runningTimeNS  int64
+	sumQueued      int // Sum of the number of queued tasks for each Get.
+	numGetCalls    int // The number of successful Get calls.
 }
 
 // NewScheduler creates a new scheduler with the given algorithm.
-func NewScheduler(algo SchedulingAlgo) *Scheduler {
+func NewScheduler(numP int, algo SchedulingAlgo) *Scheduler {
+	if numP <= 0 {
+		numP = runtime.GOMAXPROCS(0) - 1
+		if numP <= 0 {
+			numP = 1
+		}
+	}
+
 	s := &Scheduler{
-		taskq:  newTaskPriorityQueue(algo),
-		wakeCh: make(chan struct{}, 1),
-		doneCh: make(chan struct{}),
+		yieldCh: make(chan *task, runtime.GOMAXPROCS(0)),
+		doneCh:  make(chan struct{}),
+		numP:    uintptr(numP),
 	}
 
 	s.wg.Add(2)
-	go s.runQueue()
+	go s.runQueue(newTaskPriorityQueue(algo))
 	go s.runTimeSlot()
 
 	return s
@@ -56,7 +69,7 @@ func RunningTimeFair(t *task) int { return int(t.runningTime) }
 // goroutines started by Go. Yield panics if called after this
 // function has been called.
 func (s *Scheduler) Close() error {
-	close(s.wakeCh)
+	close(s.yieldCh)
 	close(s.doneCh)
 	s.wg.Wait()
 
@@ -72,16 +85,22 @@ func (s *Scheduler) Go(ctx context.Context, f func(context.Context)) {
 		timeSlot: atomic.LoadUintptr(&s.timeSlot),
 		start:    nowNano(),
 	}
+	atomic.AddUintptr(&s.numRunning, 1)
 
 	go func() {
-		defer close(t.wakeCh)
 		defer func() {
 			t.runningTime += nowNano() - t.start
 
-			atomic.AddInt64(&s.blockingTime, t.blockingTime)
-			atomic.AddInt64(&s.runningTime, t.runningTime)
+			close(t.wakeCh)
+
+			atomic.AddUintptr(&s.numRunning, ^uintptr(0))
+			s.yieldCh <- nil
+
+			atomic.AddInt64(&s.blockingTimeNS, t.blockingTime)
+			atomic.AddInt64(&s.runningTimeNS, t.runningTime)
 		}()
 
+		t.yield()
 		f(context.WithValue(ctx, taskKey, t))
 	}()
 }
@@ -89,30 +108,81 @@ func (s *Scheduler) Go(ctx context.Context, f func(context.Context)) {
 // RunningTime returns the total running time (not waiting in Yield)
 // for all goroutines.
 func (s *Scheduler) RunningTime() time.Duration {
-	return time.Duration(atomic.LoadInt64(&s.runningTime)) * time.Nanosecond
+	return time.Duration(atomic.LoadInt64(&s.runningTimeNS)) * time.Nanosecond
 }
 
 // BlockingTime returns the total blocking time (waiting in Yield) for
 // all goroutines.
 func (s *Scheduler) BlockingTime() time.Duration {
-	return time.Duration(atomic.LoadInt64(&s.blockingTime)) * time.Nanosecond
+	return time.Duration(atomic.LoadInt64(&s.blockingTimeNS)) * time.Nanosecond
+}
+
+// AvgLoad returns the average task queue size.
+func (s *Scheduler) AvgLoad() float32 {
+	return float32(s.sumQueued) / float32(s.numGetCalls)
 }
 
 // runQueue reads from the task queue and unblocks goroutines in Yield.
-func (s *Scheduler) runQueue() {
+func (s *Scheduler) runQueue(q taskQueue) {
 	defer s.wg.Done()
 
-	for range s.wakeCh {
-		for {
-			t := s.taskq.Get()
-			if t == nil {
-				break
-			}
+	for {
+		if !s.recvYielded(q) {
+			break
+		}
 
-			select {
-			case t.wakeCh <- struct{}{}:
-			default:
+		s.resumeEnough(q)
+	}
+}
+
+// recvYielded blocks until a task has yielded or terminated. It
+// receives as many tasks as are available, to maximize queue load.
+func (s *Scheduler) recvYielded(q taskQueue) bool {
+	t, ok := <-s.yieldCh
+	if !ok {
+		return false
+	}
+
+	for {
+		if t != nil {
+			atomic.AddUintptr(&s.numRunning, ^uintptr(0))
+			q.Put(t)
+		}
+		select {
+		case t, ok = <-s.yieldCh:
+			if !ok {
+				return false
 			}
+		default:
+			return true
+		}
+	}
+}
+
+// resumeEnough resumes tasks from the task queue until numP tasks are
+// running, or the queue is empty.
+func (s *Scheduler) resumeEnough(q taskQueue) {
+	for {
+		n := atomic.LoadUintptr(&s.numRunning)
+		if n >= s.numP {
+			return
+		} else if !atomic.CompareAndSwapUintptr(&s.numRunning, n, n+1) {
+			continue
+		}
+
+		t := q.Get()
+		if t == nil {
+			atomic.AddUintptr(&s.numRunning, ^uintptr(0))
+			return
+		}
+		s.sumQueued += q.Len() + 1
+		s.numGetCalls++
+
+		select {
+		case t.wakeCh <- struct{}{}:
+			// Continue.
+		default:
+			// Continue.
 		}
 	}
 }
@@ -128,6 +198,7 @@ func (s *Scheduler) runTimeSlot() {
 	for {
 		select {
 		case <-t.C:
+			// Continue.
 		case <-s.doneCh:
 			return
 		}
@@ -151,26 +222,7 @@ func Yield(ctx context.Context) {
 	default:
 	}
 
-	now := nowNano()
-	t.runningTime += now - t.start
-	t.start = now
-
-	t.s.taskq.Put(t)
-	select {
-	case t.s.wakeCh <- struct{}{}:
-	default:
-	}
-	<-t.wakeCh
-
-	t.timeSlot = atomic.LoadUintptr(&t.s.timeSlot)
-
-	now = nowNano()
-	t.blockingTime += now - t.start
-	t.start = now
-}
-
-func nowNano() int64 {
-	return time.Now().UnixNano()
+	t.yield()
 }
 
 var taskKey = new(int)
@@ -189,6 +241,25 @@ type task struct {
 	blockingTime int64
 }
 
+func (t *task) yield() {
+	now := nowNano()
+	t.runningTime += now - t.start
+	t.start = now
+
+	t.s.yieldCh <- t
+	<-t.wakeCh
+
+	t.timeSlot = atomic.LoadUintptr(&t.s.timeSlot)
+
+	now = nowNano()
+	t.blockingTime += now - t.start
+	t.start = now
+}
+
+func nowNano() int64 {
+	return time.Now().UnixNano()
+}
+
 type taskQueue interface {
 	Len() int
 	Put(t *task)
@@ -198,7 +269,6 @@ type taskQueue interface {
 type taskPriorityQueue struct {
 	prio func(*task) int
 
-	mu sync.Mutex
 	ts []*task
 }
 
@@ -209,23 +279,14 @@ func newTaskPriorityQueue(prio func(*task) int) *taskPriorityQueue {
 }
 
 func (q *taskPriorityQueue) Len() int {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
 	return len(q.ts)
 }
 
 func (q *taskPriorityQueue) Put(t *task) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
 	heap.Push((*taskHeap)(q), t)
 }
 
 func (q *taskPriorityQueue) Get() *task {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
 	if len(q.ts) == 0 {
 		return nil
 	}
