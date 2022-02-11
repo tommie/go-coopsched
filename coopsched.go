@@ -141,7 +141,7 @@ func (s *Scheduler) Do(ctx context.Context, f func(context.Context)) {
 		atomic.AddInt64(&s.waitingTimeNS, t.waitingTimeNS)
 	}()
 
-	t.yield(nil)
+	t.waitAndBlock(nil)
 	f(t.newContext(ctx))
 }
 
@@ -266,7 +266,7 @@ func Yield(ctx context.Context) {
 	default:
 	}
 
-	t.yield(nil)
+	t.waitAndBlock(nil)
 }
 
 // Wait blocks the goroutine and runs `f`, accounting it as I/O wait
@@ -283,7 +283,7 @@ func Wait(ctx context.Context, f func()) {
 	default:
 	}
 
-	t.yield(f)
+	t.waitAndBlock(f)
 }
 
 type task struct {
@@ -311,9 +311,10 @@ func (t *task) newContext(ctx context.Context) context.Context {
 	return context.WithValue(ctx, taskKey, t)
 }
 
-// yield unconditionally marks the task as blocked and sends it to the
-// scheduler.
-func (t *task) yield(f func()) {
+// waitAndBlock unconditionally marks the task as blocked and sends it
+// to the scheduler. If `f` is non-nil, it runs that function,
+// accounted as waiting time, before blocking.
+func (t *task) waitAndBlock(f func()) {
 	now := nowNano()
 	t.runningTimeNS += now - t.startNS
 	t.startNS = now
