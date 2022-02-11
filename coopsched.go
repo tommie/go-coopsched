@@ -25,6 +25,7 @@ type Scheduler struct {
 
 	blockingTimeNS int64
 	runningTimeNS  int64
+	waitingTimeNS  int64
 	sumQueued      int // Sum of the number of queued tasks for each Get.
 	numGetCalls    int // The number of successful Get calls.
 }
@@ -77,7 +78,7 @@ func (s *Scheduler) Close() error {
 
 // Go creates a new goroutine, managed by the scheduler. There's
 // nothing special about the goroutine unless Yield is called.
-func (s *Scheduler) Go(ctx context.Context, f func(context.Context)) {
+func (s *Scheduler) Do(ctx context.Context, f func(context.Context)) {
 	t := &task{
 		s:        s,
 		wakeCh:   make(chan struct{}, 1),
@@ -86,22 +87,21 @@ func (s *Scheduler) Go(ctx context.Context, f func(context.Context)) {
 	}
 	atomic.AddUintptr(&s.numRunning, 1)
 
-	go func() {
-		defer func() {
-			t.runningTimeNS += nowNano() - t.start
+	defer func() {
+		t.runningTimeNS += nowNano() - t.start
 
-			close(t.wakeCh)
+		close(t.wakeCh)
 
-			atomic.AddUintptr(&s.numRunning, ^uintptr(0))
-			s.yieldCh <- nil
+		atomic.AddUintptr(&s.numRunning, ^uintptr(0))
+		s.yieldCh <- nil
 
-			atomic.AddInt64(&s.blockingTimeNS, t.blockingTimeNS)
-			atomic.AddInt64(&s.runningTimeNS, t.runningTimeNS)
-		}()
-
-		t.yield()
-		f(t.newContext(ctx))
+		atomic.AddInt64(&s.blockingTimeNS, t.blockingTimeNS)
+		atomic.AddInt64(&s.runningTimeNS, t.runningTimeNS)
+		atomic.AddInt64(&s.waitingTimeNS, t.waitingTimeNS)
 	}()
+
+	t.yield(nil)
+	f(t.newContext(ctx))
 }
 
 // RunningTime returns the total running time (not waiting in Yield)
@@ -114,6 +114,12 @@ func (s *Scheduler) RunningTime() time.Duration {
 // all goroutines.
 func (s *Scheduler) BlockingTime() time.Duration {
 	return time.Duration(atomic.LoadInt64(&s.blockingTimeNS)) * time.Nanosecond
+}
+
+// WaitingTime returns the total waiting time (running the Wait
+// function) for all goroutines.
+func (s *Scheduler) WaitingTime() time.Duration {
+	return time.Duration(atomic.LoadInt64(&s.waitingTimeNS)) * time.Nanosecond
 }
 
 // AvgLoad returns the average task queue size.
@@ -130,7 +136,7 @@ func (s *Scheduler) runQueue(q taskQueue) {
 			break
 		}
 
-		s.resumeEnough(q)
+		s.resumeFill(q)
 	}
 }
 
@@ -144,7 +150,6 @@ func (s *Scheduler) recvYielded(q taskQueue) bool {
 
 	for {
 		if t != nil {
-			atomic.AddUintptr(&s.numRunning, ^uintptr(0))
 			q.Put(t)
 		}
 		select {
@@ -158,10 +163,10 @@ func (s *Scheduler) recvYielded(q taskQueue) bool {
 	}
 }
 
-// resumeEnough resumes tasks from the task queue until numP tasks are
+// resumeFill resumes tasks from the task queue until numP tasks are
 // running, or the queue is empty.
-func (s *Scheduler) resumeEnough(q taskQueue) {
-	for {
+func (s *Scheduler) resumeFill(q taskQueue) {
+	for q.Len() > 0 {
 		n := atomic.LoadUintptr(&s.numRunning)
 		if n >= s.numP {
 			return
@@ -170,10 +175,6 @@ func (s *Scheduler) resumeEnough(q taskQueue) {
 		}
 
 		t := q.Get()
-		if t == nil {
-			atomic.AddUintptr(&s.numRunning, ^uintptr(0))
-			return
-		}
 		s.sumQueued += q.Len() + 1
 		s.numGetCalls++
 
@@ -224,7 +225,24 @@ func Yield(ctx context.Context) {
 	default:
 	}
 
-	t.yield()
+	t.yield(nil)
+}
+
+// Wait blocks the goroutine and runs `f`, accounting it as I/O wait
+// time, rather than running time.
+func Wait(ctx context.Context, f func()) {
+	t := taskFromContext(ctx)
+	if t == nil {
+		panic(errors.New("the context doesn't reference a Scheduler"))
+	}
+
+	select {
+	case <-t.s.doneCh:
+		panic(errors.New("Wait was called after the scheduler was closed."))
+	default:
+	}
+
+	t.yield(f)
 }
 
 type task struct {
@@ -236,6 +254,7 @@ type task struct {
 	start          int64
 	runningTimeNS  int64
 	blockingTimeNS int64
+	waitingTimeNS  int64
 }
 
 func taskFromContext(ctx context.Context) *task {
@@ -251,10 +270,20 @@ func (t *task) newContext(ctx context.Context) context.Context {
 
 // yield unconditionally marks the task as blocked and sends it to the
 // scheduler.
-func (t *task) yield() {
+func (t *task) yield(f func()) {
 	now := nowNano()
 	t.runningTimeNS += now - t.start
 	t.start = now
+
+	atomic.AddUintptr(&t.s.numRunning, ^uintptr(0))
+
+	if f != nil {
+		f()
+
+		now := nowNano()
+		t.waitingTimeNS += now - t.start
+		t.start = now
+	}
 
 	t.s.yieldCh <- t
 	<-t.wakeCh

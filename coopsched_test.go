@@ -22,12 +22,23 @@ func ExampleScheduler() {
 	var wg sync.WaitGroup
 
 	wg.Add(1)
-	s.Go(ctx, func(ctx context.Context) {
+	go s.Do(ctx, func(ctx context.Context) {
 		defer wg.Done()
 
 		for i := 0; i < 1000; i++ {
 			Yield(ctx)
 			// Do some piece of the computation.
+		}
+	})
+
+	wg.Add(1)
+	go s.Do(ctx, func(ctx context.Context) {
+		defer wg.Done()
+
+		for i := 0; i < 1000; i++ {
+			Wait(ctx, func() {
+				// Do some I/O.
+			})
 		}
 	})
 
@@ -47,22 +58,24 @@ func cpuIntensiveTask(ctx context.Context, amt int, yield bool) {
 	}
 }
 
-func channelTask(ctx context.Context, amt int, yield bool) time.Duration {
-	var wait time.Duration
+func channelTask(ctx context.Context, amt int, wait bool) time.Duration {
+	var waitDur time.Duration
 
 	for i := 0; i < amt; i++ {
 		start := time.Now()
-		// Use time.After to make this a channel receive instead of
-		// (possibly) using a native timer with time.Sleep.
-		<-time.After(1 * time.Millisecond)
-		wait += time.Now().Sub(start)
 
-		if yield {
-			Yield(ctx)
+		if wait {
+			Wait(ctx, func() {
+				time.Sleep(1 * time.Millisecond)
+			})
+		} else {
+			time.Sleep(1 * time.Millisecond)
 		}
+
+		waitDur += time.Now().Sub(start)
 	}
 
-	return wait
+	return waitDur - time.Duration(amt)*time.Millisecond
 }
 
 func BenchmarkFIFO(b *testing.B) {
@@ -98,7 +111,7 @@ func doBenchmark(b *testing.B, algo SchedulingAlgo, yield bool) {
 
 		wg.Add(b.N)
 		for i := 0; i < b.N; i++ {
-			s.Go(ctx, func(ctx context.Context) {
+			go s.Do(ctx, func(ctx context.Context) {
 				defer wg.Done()
 
 				cpuIntensiveTask(ctx, amt, yield)
@@ -107,8 +120,9 @@ func doBenchmark(b *testing.B, algo SchedulingAlgo, yield bool) {
 
 		wg.Wait()
 
-		b.Logf("Avg running time: %v, avg blocking time: %v, avg load: %.1f",
+		b.Logf("Avg running time: %v, avg waiting time: %v, avg blocking time: %v, avg load: %.1f",
 			s.RunningTime()/time.Duration(b.N),
+			s.WaitingTime()/time.Duration(b.N),
 			s.BlockingTime()/time.Duration(b.N),
 			s.AvgLoad())
 	})
@@ -122,7 +136,7 @@ func doBenchmark(b *testing.B, algo SchedulingAlgo, yield bool) {
 
 		wg.Add(b.N)
 		for i := 0; i < b.N; i++ {
-			s.Go(ctx, func(ctx context.Context) {
+			go s.Do(ctx, func(ctx context.Context) {
 				defer wg.Done()
 
 				atomic.AddUint64(&waitNS, uint64(channelTask(ctx, amt, yield)/time.Nanosecond))
@@ -131,9 +145,10 @@ func doBenchmark(b *testing.B, algo SchedulingAlgo, yield bool) {
 
 		wg.Wait()
 
-		b.Logf("Avg delay overhead: %v, avg running time: %v, avg blocking time: %v, avg load: %.1f",
-			time.Duration(waitNS/uint64(b.N))*time.Nanosecond-amt*time.Millisecond,
+		b.Logf("Avg delay overhead: %v, avg running time: %v, avg waiting time: %v, avg blocking time: %v, avg load: %.1f",
+			time.Duration(waitNS/uint64(b.N))*time.Nanosecond,
 			s.RunningTime()/time.Duration(b.N),
+			s.WaitingTime()/time.Duration(b.N),
 			s.BlockingTime()/time.Duration(b.N),
 			s.AvgLoad())
 	})
@@ -147,13 +162,13 @@ func doBenchmark(b *testing.B, algo SchedulingAlgo, yield bool) {
 
 		wg.Add(2 * b.N)
 		for i := 0; i < b.N; i++ {
-			s.Go(ctx, func(ctx context.Context) {
+			go s.Do(ctx, func(ctx context.Context) {
 				defer wg.Done()
 
 				cpuIntensiveTask(ctx, amt, yield)
 			})
 
-			s.Go(ctx, func(ctx context.Context) {
+			go s.Do(ctx, func(ctx context.Context) {
 				defer wg.Done()
 
 				atomic.AddUint64(&waitNS, uint64(channelTask(ctx, amt, yield)/time.Nanosecond))
@@ -162,9 +177,10 @@ func doBenchmark(b *testing.B, algo SchedulingAlgo, yield bool) {
 
 		wg.Wait()
 
-		b.Logf("Avg delay overhead: %v, avg running time: %v, avg blocking time: %v, avg load: %.1f",
-			time.Duration(waitNS/uint64(b.N))*time.Nanosecond-amt*time.Millisecond,
+		b.Logf("Avg delay overhead: %v, avg running time: %v, avg waiting time: %v, avg blocking time: %v, avg load: %.1f",
+			time.Duration(waitNS/uint64(b.N))*time.Nanosecond,
 			s.RunningTime()/time.Duration(b.N),
+			s.WaitingTime()/time.Duration(b.N),
 			s.BlockingTime()/time.Duration(b.N),
 			s.AvgLoad())
 	})
