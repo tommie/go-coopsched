@@ -3,34 +3,32 @@
 See https://github.com/golang/go/issues/51071. I just wanted to play
 around with it myself.
 
-## Go Scheduler Notes
+## Notes about hnes/cpuworker
 
-* schedule (`runtime/proc.go`)
-  * findRunnableGCWorker
-  * globrunqget
-    * A non-local `gQueue`, which is unbounded.
-    * This call returns a `g`, but also fills `runq`.
-  * runqget
-    * A local circular buffer of 255/256 entries.
-  * findrunnable
-    * runqget
-    * globrunqget
-    * netpoll
-      * Internal `g`s for etwork polling.
-    * stealWork
-      * Takes work from another thread/CPU.
-      * stealOrder.start
-      * The only order is `randomOrder`, which picks a `P` at
-        pseudo-random.
-      * checkTimers
-        * runtimer
-      * runqget
-      * runqsteal
-        * Takes half of the other `p`s runq.
-   * `globrunqget` checked again.
-* Go preemption timeslice är 10 ms.
-* `schedEnabled` seems only used for GC pausing.
-* `casgstatus` sets `runnableTime` if tracking is enabled.
+The issue uses https://github.com/hnes/cpuworker as the testbed. Here
+are some notes about the gist of it. This repository attempts to use
+the same test-cases, but simplify the design to allow easier
+experimentation. It also has self-contained Go benchmarks.
+
+* Event-intensive tasks emulate goroutines with a lot of I/O wait.
+* The `eventRoutineCall` subsystem lets the caller emulate I/O wait
+  time.
+* The user decides if they want the new task to be an
+  "event-intensive" or "CPU" task, using `eiFlag` to `Submit3`. But
+  this only affects the initial scheduling. Any yielding thereafter
+  uses the computed event-intensity factor (EI-factor).
+* The output of `calcEIfactorAndSumbitToRunnableTaskQueue` is directly
+  used as priority for event-intensive tasks. The scheduler uses the
+  following task priorities: event-intensive (PQ by EI-factor),
+  new-task, CPU-intensive (based on EI-factor being zero, FIFO).
+* Higher EI-factor means higher priority.
+* Checkpoint is yielding, and the task's priority is decided by the
+  EI-factor.
+* Event-intensivity also determines the maximum time slice given.
+
+## Differences to hnes/cpuworker
+
+* All tasks ride on the same time slot expiration schedule.
 
 ## Initial Results (on a ThinkPad T460s laptop)
 
@@ -103,6 +101,35 @@ running more goroutines.
 
 The load is high enough for a scheduling algorithm to have possible
 impact.
+
+## Go Scheduler Notes
+
+* schedule (`runtime/proc.go`)
+  * findRunnableGCWorker
+  * globrunqget
+    * A non-local `gQueue`, which is unbounded.
+    * This call returns a `g`, but also fills `runq`.
+  * runqget
+    * A local circular buffer of 255/256 entries.
+  * findrunnable
+    * runqget
+    * globrunqget
+    * netpoll
+      * Internal `g`s for etwork polling.
+    * stealWork
+      * Takes work from another thread/CPU.
+      * stealOrder.start
+      * The only order is `randomOrder`, which picks a `P` at
+        pseudo-random.
+      * checkTimers
+        * runtimer
+      * runqget
+      * runqsteal
+        * Takes half of the other `p`s runq.
+   * `globrunqget` checked again.
+* Go preemption timeslice är 10 ms.
+* `schedEnabled` seems only used for GC pausing.
+* `casgstatus` sets `runnableTime` if tracking is enabled.
 
 ## Output from Initial Benchmarking
 

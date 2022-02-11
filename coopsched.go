@@ -52,7 +52,7 @@ func NewScheduler(numP int, algo SchedulingAlgo) *Scheduler {
 }
 
 // SchedulingAlgo is an algorithm for ordering tasks when scheduling
-// them.
+// them. A lower return value indicates a higher priority.
 type SchedulingAlgo func(t *task) int
 
 // FIFO selects the task that has waited the longest in the
