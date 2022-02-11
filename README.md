@@ -110,7 +110,7 @@ impact.
     * runqget
     * globrunqget
     * netpoll
-      * Internal `g`s for etwork polling.
+      * Internal `g`s for network polling.
     * stealWork
       * Takes work from another thread/CPU.
       * stealOrder.start
