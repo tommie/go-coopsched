@@ -15,6 +15,8 @@ import (
 // unblocks it. Yield blocks if the time slot is up, but is otherwise
 // a no-op.
 type Scheduler struct {
+	algo SchedulingAlgo
+
 	yieldCh chan *task
 	doneCh  chan struct{}
 	wg      sync.WaitGroup
@@ -40,13 +42,14 @@ func NewScheduler(numP int, algo SchedulingAlgo) *Scheduler {
 	}
 
 	s := &Scheduler{
+		algo:    algo,
 		yieldCh: make(chan *task, runtime.GOMAXPROCS(0)),
 		doneCh:  make(chan struct{}),
 		numP:    uintptr(numP),
 	}
 
 	s.wg.Add(2)
-	go s.runQueue(newTaskPriorityQueue(algo))
+	go s.runQueue(newTaskPriorityQueue())
 	go s.runTimeSlot()
 
 	return s
@@ -54,16 +57,16 @@ func NewScheduler(numP int, algo SchedulingAlgo) *Scheduler {
 
 // SchedulingAlgo is an algorithm for ordering tasks when scheduling
 // them. A lower return value indicates a higher priority.
-type SchedulingAlgo func(t *task) int
+type SchedulingAlgo func(t *task) int64
 
 // FIFO selects the task that has waited the longest in the
 // queue. This is what the Go scheduler (runq) does now.
-func FIFO(t *task) int { return int(t.start) }
+func FIFO(t *task) int64 { return t.start }
 
 // RunningTimeFair selects the goroutine that has been running the
 // least amount of time. This implements the proposed CFS without
 // priorities.
-func RunningTimeFair(t *task) int { return int(t.runningTimeNS) }
+func RunningTimeFair(t *task) int64 { return t.runningTimeNS }
 
 // Close stops the scheduler's internal goroutines, but does not stop
 // goroutines started by Go. Yield panics if called after this
@@ -255,6 +258,8 @@ type task struct {
 	runningTimeNS  int64
 	blockingTimeNS int64
 	waitingTimeNS  int64
+
+	priority int64
 }
 
 func taskFromContext(ctx context.Context) *task {
@@ -284,6 +289,8 @@ func (t *task) yield(f func()) {
 		t.waitingTimeNS += now - t.start
 		t.start = now
 	}
+
+	t.priority = t.s.algo(t)
 
 	t.s.yieldCh <- t
 	<-t.wakeCh

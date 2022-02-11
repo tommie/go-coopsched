@@ -9,15 +9,11 @@ type taskQueue interface {
 }
 
 type taskPriorityQueue struct {
-	prio func(*task) int
-
 	ts []*task
 }
 
-func newTaskPriorityQueue(prio func(*task) int) *taskPriorityQueue {
-	return &taskPriorityQueue{
-		prio: prio,
-	}
+func newTaskPriorityQueue() *taskPriorityQueue {
+	return &taskPriorityQueue{}
 }
 
 func (q *taskPriorityQueue) Len() int {
@@ -41,7 +37,7 @@ func (q *taskPriorityQueue) Get() *task {
 type taskHeap taskPriorityQueue
 
 func (h *taskHeap) Len() int           { return len(h.ts) }
-func (h *taskHeap) Less(i, j int) bool { return h.prio(h.ts[i]) < h.prio(h.ts[j]) }
+func (h *taskHeap) Less(i, j int) bool { return h.ts[i].priority < h.ts[j].priority }
 func (h *taskHeap) Swap(i, j int)      { h.ts[i], h.ts[j] = h.ts[j], h.ts[i] }
 func (h *taskHeap) Push(t interface{}) { h.ts = append(h.ts, t.(*task)) }
 
