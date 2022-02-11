@@ -21,7 +21,7 @@ type Scheduler struct {
 	doneCh  chan struct{}
 	wg      sync.WaitGroup
 
-	numP       uintptr // Configured number of running goroutines.
+	conc       uintptr // Configured number of running goroutines.
 	numRunning uintptr // Actual number of running goroutines.
 	timeSlot   uintptr // The currently executing time slot.
 
@@ -32,12 +32,13 @@ type Scheduler struct {
 	numGetCalls    int // The number of successful Get calls.
 }
 
-// NewScheduler creates a new scheduler with the given algorithm.
-func NewScheduler(numP int, algo SchedulingAlgo) *Scheduler {
-	if numP <= 0 {
-		numP = runtime.GOMAXPROCS(0) - 1
-		if numP <= 0 {
-			numP = 1
+// NewScheduler creates a new scheduler with the given algorithm and
+// concurrency.
+func NewScheduler(conc int, algo SchedulingAlgo) *Scheduler {
+	if conc <= 0 {
+		conc = runtime.GOMAXPROCS(0) - 1
+		if conc <= 0 {
+			conc = 1
 		}
 	}
 
@@ -45,7 +46,7 @@ func NewScheduler(numP int, algo SchedulingAlgo) *Scheduler {
 		algo:    algo,
 		yieldCh: make(chan *task, runtime.GOMAXPROCS(0)),
 		doneCh:  make(chan struct{}),
-		numP:    uintptr(numP),
+		conc:    uintptr(conc),
 	}
 
 	s.wg.Add(2)
@@ -61,12 +62,50 @@ type SchedulingAlgo func(t *task) int64
 
 // FIFO selects the task that has waited the longest in the
 // queue. This is what the Go scheduler (runq) does now.
-func FIFO(t *task) int64 { return t.start }
+func FIFO(t *task) int64 { return t.startNS }
 
-// RunningTimeFair selects the goroutine that has been running the
-// least amount of time. This implements the proposed CFS without
-// priorities.
-func RunningTimeFair(t *task) int64 { return t.runningTimeNS }
+// Waitiness orders tasks after the proportion of time spent
+// waiting. It prefers tasks with more waiting than running. It
+// essentially encodes a priority tuple like
+//
+//   (is-new, bucket(wait / (wait + run)), time-slot-age)
+//
+// into an int64. "is-new" becomes the sign. The age is used to create
+// a (coarse) FIFO witih each bucket. The timing bucket occupies the
+// top `factorBits" and the age the remaining bits.
+func Waitiness(t *task) int64 {
+	const (
+		factorBits = 15
+		ageBits    = 63 - factorBits
+
+		factorMax = 1<<factorBits - 1
+		ageMax    = 1<<ageBits - 1
+
+		// factorHighBucketWidth is the fuzz-factor for CPU-intensive
+		// tasks. The value 8 is loosely derived from cpuworker.go,
+		// while it has a slightly different interpretation. Range [0,
+		// factorMax].
+		factorHighBucketWidth = factorMax / 8
+	)
+
+	if t.timeSlot == 0 {
+		// New tasks are FIFOd with highest priority.
+		return -int64(ageMax - atomic.LoadUintptr(&t.s.timeSlot))
+	}
+
+	rtNS := atomic.LoadInt64(&t.runningTimeNS)
+	wtNS := atomic.LoadInt64(&t.waitingTimeNS)
+	factor := factorMax * rtNS / (wtNS + rtNS) // Range [0, factorMax].
+	if factor >= factorMax-factorHighBucketWidth {
+		// This is a CPU-intensive task. This rounding increases load
+		// in that bucket of the queue, making more tasks become
+		// FIFO-scheduled together.
+		factor = factorMax
+	}
+
+	// Within each waitiness factor bucket, use a FIFO.
+	return (factor << (63 - factorBits)) | int64(t.timeSlot)
+}
 
 // Close stops the scheduler's internal goroutines, but does not stop
 // goroutines started by Go. Yield panics if called after this
@@ -83,15 +122,14 @@ func (s *Scheduler) Close() error {
 // nothing special about the goroutine unless Yield is called.
 func (s *Scheduler) Do(ctx context.Context, f func(context.Context)) {
 	t := &task{
-		s:        s,
-		wakeCh:   make(chan struct{}, 1),
-		timeSlot: atomic.LoadUintptr(&s.timeSlot),
-		start:    nowNano(),
+		s:       s,
+		wakeCh:  make(chan struct{}, 1),
+		startNS: nowNano(),
 	}
 	atomic.AddUintptr(&s.numRunning, 1)
 
 	defer func() {
-		t.runningTimeNS += nowNano() - t.start
+		t.runningTimeNS += nowNano() - t.startNS
 
 		close(t.wakeCh)
 
@@ -171,7 +209,7 @@ func (s *Scheduler) recvYielded(q taskQueue) bool {
 func (s *Scheduler) resumeFill(q taskQueue) {
 	for q.Len() > 0 {
 		n := atomic.LoadUintptr(&s.numRunning)
-		if n >= s.numP {
+		if n >= s.conc {
 			return
 		} else if !atomic.CompareAndSwapUintptr(&s.numRunning, n, n+1) {
 			continue
@@ -252,9 +290,9 @@ type task struct {
 	s *Scheduler
 
 	wakeCh   chan struct{}
-	timeSlot uintptr
+	timeSlot uintptr // Zero indicates a previously unscheduled task.
 
-	start          int64
+	startNS        int64
 	runningTimeNS  int64
 	blockingTimeNS int64
 	waitingTimeNS  int64
@@ -277,8 +315,8 @@ func (t *task) newContext(ctx context.Context) context.Context {
 // scheduler.
 func (t *task) yield(f func()) {
 	now := nowNano()
-	t.runningTimeNS += now - t.start
-	t.start = now
+	t.runningTimeNS += now - t.startNS
+	t.startNS = now
 
 	atomic.AddUintptr(&t.s.numRunning, ^uintptr(0))
 
@@ -286,8 +324,8 @@ func (t *task) yield(f func()) {
 		f()
 
 		now := nowNano()
-		t.waitingTimeNS += now - t.start
-		t.start = now
+		t.waitingTimeNS += now - t.startNS
+		t.startNS = now
 	}
 
 	t.priority = t.s.algo(t)
@@ -298,8 +336,8 @@ func (t *task) yield(f func()) {
 	t.timeSlot = atomic.LoadUintptr(&t.s.timeSlot)
 
 	now = nowNano()
-	t.blockingTimeNS += now - t.start
-	t.start = now
+	t.blockingTimeNS += now - t.startNS
+	t.startNS = now
 }
 
 func nowNano() int64 {

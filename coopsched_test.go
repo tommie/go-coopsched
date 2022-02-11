@@ -3,6 +3,7 @@ package coopsched
 import (
 	"context"
 	"hash/crc32"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,7 +17,7 @@ const cpuFactor = 66
 func ExampleScheduler() {
 	ctx := context.TODO()
 
-	s := NewScheduler(0, RunningTimeFair)
+	s := NewScheduler(0, Waitiness)
 	defer s.Close()
 
 	var wg sync.WaitGroup
@@ -58,7 +59,7 @@ func cpuIntensiveTask(ctx context.Context, amt int, yield bool) {
 	}
 }
 
-func channelTask(ctx context.Context, amt int, wait bool) time.Duration {
+func sleepTask(ctx context.Context, amt int, wait bool) time.Duration {
 	var waitDur time.Duration
 
 	for i := 0; i < amt; i++ {
@@ -88,13 +89,13 @@ func BenchmarkFIFO(b *testing.B) {
 	})
 }
 
-func BenchmarkRunningTimeFair(b *testing.B) {
+func BenchmarkWaitness(b *testing.B) {
 	b.Run("yield", func(b *testing.B) {
-		doBenchmark(b, RunningTimeFair, true)
+		doBenchmark(b, Waitiness, true)
 	})
 
 	b.Run("noYield", func(b *testing.B) {
-		doBenchmark(b, RunningTimeFair, false)
+		doBenchmark(b, Waitiness, false)
 	})
 }
 
@@ -103,8 +104,17 @@ func doBenchmark(b *testing.B, algo SchedulingAlgo, yield bool) {
 
 	const amt = 100
 
-	b.Run("cpu", func(b *testing.B) {
-		s := NewScheduler(0, algo)
+	conc := runtime.GOMAXPROCS(0) - 1
+	if !yield {
+		// When using the scheduler, we reserve one core for
+		// bookkeeping, so we need to do the same when running the
+		// tests without yielding to the scheduler.
+		oldConc := runtime.GOMAXPROCS(conc)
+		b.Cleanup(func() { runtime.GOMAXPROCS(oldConc) })
+	}
+
+	b.Run("run", func(b *testing.B) {
+		s := NewScheduler(conc, algo)
 		defer s.Close()
 
 		var wg sync.WaitGroup
@@ -127,8 +137,8 @@ func doBenchmark(b *testing.B, algo SchedulingAlgo, yield bool) {
 			s.AvgLoad())
 	})
 
-	b.Run("channel", func(b *testing.B) {
-		s := NewScheduler(0, algo)
+	b.Run("wait", func(b *testing.B) {
+		s := NewScheduler(conc, algo)
 		defer s.Close()
 
 		var waitNS uint64
@@ -139,7 +149,7 @@ func doBenchmark(b *testing.B, algo SchedulingAlgo, yield bool) {
 			go s.Do(ctx, func(ctx context.Context) {
 				defer wg.Done()
 
-				atomic.AddUint64(&waitNS, uint64(channelTask(ctx, amt, yield)/time.Nanosecond))
+				atomic.AddUint64(&waitNS, uint64(sleepTask(ctx, amt, yield)/time.Nanosecond))
 			})
 		}
 
@@ -154,7 +164,7 @@ func doBenchmark(b *testing.B, algo SchedulingAlgo, yield bool) {
 	})
 
 	b.Run("mixed", func(b *testing.B) {
-		s := NewScheduler(0, algo)
+		s := NewScheduler(conc, algo)
 		defer s.Close()
 
 		var waitNS uint64
@@ -171,7 +181,7 @@ func doBenchmark(b *testing.B, algo SchedulingAlgo, yield bool) {
 			go s.Do(ctx, func(ctx context.Context) {
 				defer wg.Done()
 
-				atomic.AddUint64(&waitNS, uint64(channelTask(ctx, amt, yield)/time.Nanosecond))
+				atomic.AddUint64(&waitNS, uint64(sleepTask(ctx, amt, yield)/time.Nanosecond))
 			})
 		}
 
