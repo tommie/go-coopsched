@@ -30,6 +30,8 @@ experimentation. It also has self-contained Go benchmarks.
 
 * All tasks ride on the same time slot expiration schedule.
 * Event time is renamed "wait time".
+* New tasks have highest priority, instead of sitting between
+  wait-intensive and CPU-intensive.
 * The EI-factor is based on `w / (w + r)` instead of `w / r`, to have
   a bounded value.
 * The factor calculation never resets the accumulated time buckets,
