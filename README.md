@@ -36,6 +36,18 @@ experimentation. It also has self-contained Go benchmarks.
   thus it's less likely to change priority quickly.
 * There is no explicit `P`, instead replaced by a `numRunning` counter.
 
+## Benchmark Design
+
+These benchmarks use `b.N` to run a number of complete tests where 100
+tasks per type are created and waited for. Each task performs some 100
+operations, yielding in-between. The `noYield` versions run the same
+code, but skips calling `Yield` and `Wait` (depending on task type.)
+
+As an example, for the sleep task, a total of `100*100*b.N` calls to
+`time.Sleep` are performed per benchmark run. This is similar to the
+demo in hnes/cpuworker, except `ab` would continuously use 100
+concurrent requests out of 10M instead of running separate batches.
+
 ## Initial Results (on a ThinkPad T460s laptop with external power)
 
 The "avg delay overhead" is how long we waited in `<-time.After`,
@@ -50,17 +62,8 @@ should all be equivalent, and never blocks in `Yield`. The numbers are
 in the same ballpark, and the accuracy is fair:
 
 ```
-BenchmarkFIFO/noYield/mixed
-    coopsched_test.go:190: Avg delay overhead: 8.641522ms, avg running time: 231.800104ms, avg waiting time: 0s, avg blocking time: 53.515µs, avg load: 1.0
-    coopsched_test.go:190: Avg delay overhead: 9.32816ms, avg running time: 213.312939ms, avg waiting time: 0s, avg blocking time: 7.108740776s, avg load: 98.0
-    coopsched_test.go:190: Avg delay overhead: 9.16891ms, avg running time: 214.27536ms, avg waiting time: 0s, avg blocking time: 23.544226144s, avg load: 331.5
-BenchmarkFIFO/noYield/mixed-4     	     334	  71510421 ns/op
-
-BenchmarkWaitness/noYield/mixed
-    coopsched_test.go:190: Avg delay overhead: 8.099852ms, avg running time: 235.244041ms, avg waiting time: 0s, avg blocking time: 193.591µs, avg load: 1.0
-    coopsched_test.go:190: Avg delay overhead: 8.807681ms, avg running time: 213.335696ms, avg waiting time: 0s, avg blocking time: 7.011995933s, avg load: 97.5
-    coopsched_test.go:190: Avg delay overhead: 8.946962ms, avg running time: 212.287389ms, avg waiting time: 0s, avg blocking time: 23.458988595s, avg load: 331.5
-BenchmarkWaitness/noYield/mixed-4           	     334	  70840761 ns/op
+BenchmarkFIFO/noYield/mixed-4     	       6	1982894160 ns/op	        27.61 avg-load	   1834925 block-µs/op	    193734 run-µs/op	     12337 wait-overhead-µs/op	         0 wait-µs/op
+BenchmarkWaitiness/noYield/mixed-4         6	2000242534 ns/op	        27.60 avg-load	   1886621 block-µs/op	    195722 run-µs/op	     13489 wait-overhead-µs/op	         0 wait-µs/op
 ```
 
 FIFO is what Go does, so we wouldn't expect that to be very different
@@ -70,45 +73,26 @@ time. The much worse overhead may be due to the large load making the
 scheduler a bottleneck, as indicated by the greater blocking time:
 
 ```
-BenchmarkFIFO/yield/mixed
-    coopsched_test.go:190: Avg delay overhead: 10.246976ms, avg running time: 136.791718ms, avg waiting time: 109.716914ms, avg blocking time: 613.792µs, avg load: 1.0
-    coopsched_test.go:190: Avg delay overhead: 4.618824677s, avg running time: 118.77109ms, avg waiting time: 125.86504ms, avg blocking time: 8.826939651s, avg load: 104.2
-    coopsched_test.go:190: Avg delay overhead: 23.44885831s, avg running time: 119.524427ms, avg waiting time: 124.244686ms, avg blocking time: 44.700739169s, avg load: 584.8
-BenchmarkFIFO/yield/mixed-4       	     490	  49732581 ns/op
-
-BenchmarkFIFO/noYield/mixed
-    coopsched_test.go:190: Avg delay overhead: 8.641522ms, avg running time: 231.800104ms, avg waiting time: 0s, avg blocking time: 53.515µs, avg load: 1.0
-    coopsched_test.go:190: Avg delay overhead: 9.32816ms, avg running time: 213.312939ms, avg waiting time: 0s, avg blocking time: 7.108740776s, avg load: 98.0
-    coopsched_test.go:190: Avg delay overhead: 9.16891ms, avg running time: 214.27536ms, avg waiting time: 0s, avg blocking time: 23.544226144s, avg load: 331.5
-BenchmarkFIFO/noYield/mixed-4     	     334	  71510421 ns/op
+BenchmarkFIFO/yield/mixed-4       	       8	1289674838 ns/op	        17.97 avg-load	   2126736 block-µs/op	    102034 run-µs/op	   1140682 wait-overhead-µs/op	    129450 wait-µs/op
+BenchmarkFIFO/noYield/mixed-4     	       6	1982894160 ns/op	        27.61 avg-load	   1834925 block-µs/op	    193734 run-µs/op	     12337 wait-overhead-µs/op	         0 wait-µs/op
 ```
 
 Finally, `Waitiess` should give a lower overhead than FIFO, and that
 should be due to lower blocking time. Note that delay overhead only
 looks at the channel-intensive goroutines, not the CPU-intensive ones,
 while both types yield to the scheduler. It does improve a factor of
-10x for overhead, and around 2x for blocking time:
+5x for wait-overhead, and around 2x for blocking time:
 
 ```
-BenchmarkFIFO/yield/mixed
-    coopsched_test.go:190: Avg delay overhead: 10.246976ms, avg running time: 136.791718ms, avg waiting time: 109.716914ms, avg blocking time: 613.792µs, avg load: 1.0
-    coopsched_test.go:190: Avg delay overhead: 4.618824677s, avg running time: 118.77109ms, avg waiting time: 125.86504ms, avg blocking time: 8.826939651s, avg load: 104.2
-    coopsched_test.go:190: Avg delay overhead: 23.44885831s, avg running time: 119.524427ms, avg waiting time: 124.244686ms, avg blocking time: 44.700739169s, avg load: 584.8
-BenchmarkFIFO/yield/mixed-4       	     490	  49732581 ns/op
-
-BenchmarkWaitness/yield/mixed
-    coopsched_test.go:190: Avg delay overhead: 10.652347ms, avg running time: 150.509321ms, avg waiting time: 110.139238ms, avg blocking time: 561.179µs, avg load: 1.0
-    coopsched_test.go:190: Avg delay overhead: 473.395621ms, avg running time: 124.917855ms, avg waiting time: 126.520127ms, avg blocking time: 5.213434736s, avg load: 136.9
-    coopsched_test.go:190: Avg delay overhead: 2.321544413s, avg running time: 121.48177ms, avg waiting time: 127.387055ms, avg blocking time: 25.273282698s, avg load: 708.2
-BenchmarkWaitness/yield/mixed-4   	     493	  46895588 ns/op
+BenchmarkFIFO/yield/mixed-4       	       8	1289674838 ns/op	        17.97 avg-load	   2126736 block-µs/op	    102034 run-µs/op	   1140682 wait-overhead-µs/op	    129450 wait-µs/op
+BenchmarkWaitiness/yield/mixed-4  	       8	1310149936 ns/op	        38.20 avg-load	   1379195 block-µs/op	    102958 run-µs/op	    204797 wait-overhead-µs/op	    124973 wait-µs/op
 ```
 
 ## Conclusions
 
 It took a couple of iterations (see Git history) to get this to do
 what https://github.com/hnes/cpuworker does in terms of test
-cases. That code uses a `running / wait` priority, which is not yet
-implemented here.
+cases.
 
 The load is high enough for a scheduling algorithm to have possible
 impact.
@@ -144,80 +128,26 @@ impact.
 
 ## Output from Initial Benchmarking
 
-Fifth version.
+Sixth version.
 
 ```console
-$ go test -v -bench . -benchtime 20s ./
+$ go test -bench . -benchtime 10s ./
 goos: linux
 goarch: amd64
 pkg: github.com/tommie/go-coopsched
 cpu: Intel(R) Core(TM) i7-6600U CPU @ 2.60GHz
-BenchmarkFIFO
-BenchmarkFIFO/yield
-BenchmarkFIFO/yield/run
-    coopsched_test.go:133: Avg running time: 86.563174ms, avg waiting time: 0s, avg blocking time: 35.856µs, avg load: 1.0
-    coopsched_test.go:133: Avg running time: 117.479254ms, avg waiting time: 0s, avg blocking time: 3.645990717s, avg load: 90.3
-    coopsched_test.go:133: Avg running time: 116.053511ms, avg waiting time: 0s, avg blocking time: 22.397650729s, avg load: 557.7
-BenchmarkFIFO/yield/run-4         	     609	  38749735 ns/op
-BenchmarkFIFO/yield/wait
-    coopsched_test.go:158: Avg delay overhead: 16.855053ms, avg running time: 140.267µs, avg waiting time: 116.120459ms, avg blocking time: 632.043µs, avg load: 1.0
-    coopsched_test.go:158: Avg delay overhead: 457.640991ms, avg running time: 92.264µs, avg waiting time: 128.438049ms, avg blocking time: 430.204576ms, avg load: 74.7
-    coopsched_test.go:158: Avg delay overhead: 28.473946484s, avg running time: 106.666µs, avg waiting time: 128.242901ms, avg blocking time: 28.586685482s, avg load: 4203.5
-BenchmarkFIFO/yield/wait-4     	    4250	   6764641 ns/op
-BenchmarkFIFO/yield/mixed
-    coopsched_test.go:190: Avg delay overhead: 10.246976ms, avg running time: 136.791718ms, avg waiting time: 109.716914ms, avg blocking time: 613.792µs, avg load: 1.0
-    coopsched_test.go:190: Avg delay overhead: 4.618824677s, avg running time: 118.77109ms, avg waiting time: 125.86504ms, avg blocking time: 8.826939651s, avg load: 104.2
-    coopsched_test.go:190: Avg delay overhead: 23.44885831s, avg running time: 119.524427ms, avg waiting time: 124.244686ms, avg blocking time: 44.700739169s, avg load: 584.8
-BenchmarkFIFO/yield/mixed-4       	     490	  49732581 ns/op
-BenchmarkFIFO/noYield
-BenchmarkFIFO/noYield/run
-    coopsched_test.go:133: Avg running time: 144.276303ms, avg waiting time: 0s, avg blocking time: 13.798µs, avg load: 1.0
-    coopsched_test.go:133: Avg running time: 122.614947ms, avg waiting time: 0s, avg blocking time: 1.984100834s, avg load: 50.5
-    coopsched_test.go:133: Avg running time: 121.49422ms, avg waiting time: 0s, avg blocking time: 11.77409351s, avg load: 289.5
-BenchmarkFIFO/noYield/run-4       	     584	  40546861 ns/op
-BenchmarkFIFO/noYield/wait
-    coopsched_test.go:158: Avg delay overhead: 27.637555ms, avg running time: 127.66953ms, avg waiting time: 0s, avg blocking time: 3.931µs, avg load: 1.0
-    coopsched_test.go:158: Avg delay overhead: 26.446431ms, avg running time: 126.485363ms, avg waiting time: 0s, avg blocking time: 2.03918686s, avg load: 50.5
-    coopsched_test.go:158: Avg delay overhead: 26.568025ms, avg running time: 126.609601ms, avg waiting time: 0s, avg blocking time: 11.675367535s, avg load: 276.6
-BenchmarkFIFO/noYield/wait-4   	     558	  42208863 ns/op
-BenchmarkFIFO/noYield/mixed
-    coopsched_test.go:190: Avg delay overhead: 8.641522ms, avg running time: 231.800104ms, avg waiting time: 0s, avg blocking time: 53.515µs, avg load: 1.0
-    coopsched_test.go:190: Avg delay overhead: 9.32816ms, avg running time: 213.312939ms, avg waiting time: 0s, avg blocking time: 7.108740776s, avg load: 98.0
-    coopsched_test.go:190: Avg delay overhead: 9.16891ms, avg running time: 214.27536ms, avg waiting time: 0s, avg blocking time: 23.544226144s, avg load: 331.5
-BenchmarkFIFO/noYield/mixed-4     	     334	  71510421 ns/op
-BenchmarkWaitness
-BenchmarkWaitness/yield
-BenchmarkWaitness/yield/run
-    coopsched_test.go:133: Avg running time: 98.934403ms, avg waiting time: 0s, avg blocking time: 50.029µs, avg load: 1.0
-    coopsched_test.go:133: Avg running time: 120.891455ms, avg waiting time: 0s, avg blocking time: 3.762729562s, avg load: 91.0
-    coopsched_test.go:133: Avg running time: 120.159477ms, avg waiting time: 0s, avg blocking time: 22.786406628s, avg load: 548.5
-BenchmarkWaitness/yield/run-4     	     594	  40126057 ns/op
-BenchmarkWaitness/yield/wait
-    coopsched_test.go:158: Avg delay overhead: 29.971548ms, avg running time: 91.723µs, avg waiting time: 129.357676ms, avg blocking time: 550.208µs, avg load: 1.0
-    coopsched_test.go:158: Avg delay overhead: 249.458333ms, avg running time: 89.984µs, avg waiting time: 129.739856ms, avg blocking time: 225.757915ms, avg load: 40.6
-    coopsched_test.go:158: Avg delay overhead: 13.183201578s, avg running time: 101.783µs, avg waiting time: 127.854098ms, avg blocking time: 13.288157823s, avg load: 2037.9
-BenchmarkWaitness/yield/wait-4 	    4029	   6361365 ns/op
-BenchmarkWaitness/yield/mixed
-    coopsched_test.go:190: Avg delay overhead: 10.652347ms, avg running time: 150.509321ms, avg waiting time: 110.139238ms, avg blocking time: 561.179µs, avg load: 1.0
-    coopsched_test.go:190: Avg delay overhead: 473.395621ms, avg running time: 124.917855ms, avg waiting time: 126.520127ms, avg blocking time: 5.213434736s, avg load: 136.9
-    coopsched_test.go:190: Avg delay overhead: 2.321544413s, avg running time: 121.48177ms, avg waiting time: 127.387055ms, avg blocking time: 25.273282698s, avg load: 708.2
-BenchmarkWaitness/yield/mixed-4   	     493	  46895588 ns/op
-BenchmarkWaitness/noYield
-BenchmarkWaitness/noYield/run
-    coopsched_test.go:133: Avg running time: 101.65178ms, avg waiting time: 0s, avg blocking time: 3.854µs, avg load: 1.0
-    coopsched_test.go:133: Avg running time: 122.080144ms, avg waiting time: 0s, avg blocking time: 1.974096558s, avg load: 47.6
-    coopsched_test.go:133: Avg running time: 122.605196ms, avg waiting time: 0s, avg blocking time: 11.849945822s, avg load: 289.5
-BenchmarkWaitness/noYield/run-4   	     584	  40929987 ns/op
-BenchmarkWaitness/noYield/wait
-    coopsched_test.go:158: Avg delay overhead: 25.058955ms, avg running time: 125.086241ms, avg waiting time: 0s, avg blocking time: 6.004µs, avg load: 1.0
-    coopsched_test.go:158: Avg delay overhead: 26.569652ms, avg running time: 126.608484ms, avg waiting time: 0s, avg blocking time: 2.046488741s, avg load: 47.6
-    coopsched_test.go:158: Avg delay overhead: 26.376953ms, avg running time: 126.418227ms, avg waiting time: 0s, avg blocking time: 11.660306793s, avg load: 275.5
-BenchmarkWaitness/noYield/wait-4         	     556	  42297174 ns/op
-BenchmarkWaitness/noYield/mixed
-    coopsched_test.go:190: Avg delay overhead: 8.099852ms, avg running time: 235.244041ms, avg waiting time: 0s, avg blocking time: 193.591µs, avg load: 1.0
-    coopsched_test.go:190: Avg delay overhead: 8.807681ms, avg running time: 213.335696ms, avg waiting time: 0s, avg blocking time: 7.011995933s, avg load: 97.5
-    coopsched_test.go:190: Avg delay overhead: 8.946962ms, avg running time: 212.287389ms, avg waiting time: 0s, avg blocking time: 23.458988595s, avg load: 331.5
-BenchmarkWaitness/noYield/mixed-4           	     334	  70840761 ns/op
+BenchmarkFIFO/yield/run-4         	      13	 912782670 ns/op	        25.52 avg-load	    780148 block-µs/op	     90906 run-µs/op	         0 wait-overhead-µs/op	         0 wait-µs/op
+BenchmarkFIFO/yield/wait-4        	      67	 170363049 ns/op	         6.02 avg-load	     36457 block-µs/op	        94 run-µs/op	     62958 wait-overhead-µs/op	    127231 wait-µs/op
+BenchmarkFIFO/yield/mixed-4       	       8	1289674838 ns/op	        17.97 avg-load	   2126736 block-µs/op	    102034 run-µs/op	   1140682 wait-overhead-µs/op	    129450 wait-µs/op
+BenchmarkFIFO/noYield/run-4       	      12	 956969815 ns/op	        12.72 avg-load	    420550 block-µs/op	     92803 run-µs/op	         0 wait-overhead-µs/op	         0 wait-µs/op
+BenchmarkFIFO/noYield/wait-4      	       8	1254513704 ns/op	        13.04 avg-load	    564536 block-µs/op	    125391 run-µs/op	     25351 wait-overhead-µs/op	         0 wait-µs/op
+BenchmarkFIFO/noYield/mixed-4     	       6	1982894160 ns/op	        27.61 avg-load	   1834925 block-µs/op	    193734 run-µs/op	     12337 wait-overhead-µs/op	         0 wait-µs/op
+BenchmarkWaitiness/yield/run-4    	      12	 915748782 ns/op	        25.59 avg-load	    783788 block-µs/op	     91213 run-µs/op	         0 wait-overhead-µs/op	         0 wait-µs/op
+BenchmarkWaitiness/yield/wait-4   	      48	 214082004 ns/op	         5.31 avg-load	     32040 block-µs/op	        93 run-µs/op	     58974 wait-overhead-µs/op	    127550 wait-µs/op
+BenchmarkWaitiness/yield/mixed-4  	       8	1310149936 ns/op	        38.20 avg-load	   1379195 block-µs/op	    102958 run-µs/op	    204797 wait-overhead-µs/op	    124973 wait-µs/op
+BenchmarkWaitiness/noYield/run-4  	      12	 937030950 ns/op	        12.71 avg-load	    414003 block-µs/op	     91611 run-µs/op	         0 wait-overhead-µs/op	         0 wait-µs/op
+BenchmarkWaitiness/noYield/wait-4 	       8	1264407792 ns/op	        13.05 avg-load	    569199 block-µs/op	    126408 run-µs/op	     26367 wait-overhead-µs/op	         0 wait-µs/op
+BenchmarkWaitiness/noYield/mixed-4         6	2000242534 ns/op	        27.60 avg-load	   1886621 block-µs/op	    195722 run-µs/op	     13489 wait-overhead-µs/op	         0 wait-µs/op
 PASS
-ok  	github.com/tommie/go-coopsched	343.093s
+ok  	github.com/tommie/go-coopsched	154.875s
 ```
