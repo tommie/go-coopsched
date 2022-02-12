@@ -1,5 +1,7 @@
 # A benchmark and playground for Completely Fair Scheduling in Go
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/tommie/go-coopsched.svg)](https://pkg.go.dev/github.com/tommie/go-coopsched)
+
 See https://github.com/golang/go/issues/51071. I just wanted to play
 around with it myself.
 
